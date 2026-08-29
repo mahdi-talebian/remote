@@ -1,0 +1,4 @@
+*.zip
+ssh-addresses.txt
+deploy.log
+*.log
