@@ -127,6 +127,51 @@ if ($newItem) {
 $fnLVI = Get-FunctionText -Path $Console -Name 'New-ListViewItem'
 Check 'console: New-ListViewItem extractable (defensive creation)' ($null -ne $fnLVI)
 
+# ---------------- TEST 6: REAL deploy (LAN mode) ----------------
+function Fix-Ownership {
+    $u = (& id -un); $g = (& id -gn)
+    & sudo chown -R ('{0}:{1}' -f $u, $g) $RunDir 2>$null
+}
+$realIp = ''
+$rt = (& ip route get 1.1.1.1 2>$null | Select-Object -First 1)
+if ($rt -match 'src\s+(\d{1,3}(?:\.\d{1,3}){3})') { $realIp = $matches[1] }
+Check 'env: real network IP detected' ($realIp -ne '') ('ip=' + $realIp)
+
+# 6a. auto-detected IP
+$base1 = "$RunDir/agent1"
+$a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Deploy,
+       '-AdminPassword', $Pass, '-Hostname', 'pc-01')
+$env:RA_BASEDIR = $base1
+$out1 = (& sudo --preserve-env=RA_BASEDIR $PWSH @a 2>&1 | Out-String); $code1 = $LASTEXITCODE
+$env:RA_BASEDIR = $null
+Check 'deploy#1 exit code = 0' ($code1 -eq 0) ("exit=$code1")
+Check 'deploy#1 prints [DEPLOY-STATUS] SUCCESS' ($out1 -match '\[DEPLOY-STATUS\] SUCCESS')
+Check 'deploy#1 marker = it_remote@<real IP>' ($out1 -match ('SSH-ADDRESS: it_remote@' + [regex]::Escape($realIp) + '\b')) ("want=it_remote@$realIp")
+Check 'deploy#1 mentions LAN mode' ($out1 -match 'LAN mode')
+Fix-Ownership
+$last1 = (Get-Content (Join-Path $base1 'last-address.txt') -ErrorAction SilentlyContinue | Select-Object -First 1)
+Check 'deploy#1 last-address.txt = ssh it_remote@<real IP>' ($last1 -eq ('ssh it_remote@' + $realIp)) ("got=$last1")
+$addr1 = (Get-Content (Join-Path $base1 'ssh-address.txt') -ErrorAction SilentlyContinue) -join ' '
+Check 'deploy#1 ssh-address.txt has SSH-ADDRESS + user' ($addr1 -match 'SSH-ADDRESS: ssh it_remote@' -and $addr1 -match 'User:\s+it_remote')
+
+# 6b. -LanIp override
+$base2 = "$RunDir/agent2"
+$a2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Deploy,
+        '-AdminPassword', $Pass, '-Hostname', 'pc-02', '-LanIp', '127.0.0.1')
+$env:RA_BASEDIR = $base2
+$out2 = (& sudo --preserve-env=RA_BASEDIR $PWSH @a2 2>&1 | Out-String); $code2 = $LASTEXITCODE
+$env:RA_BASEDIR = $null
+Check 'deploy#2 (-LanIp 127.0.0.1) exit code = 0' ($code2 -eq 0) ("exit=$code2")
+Check 'deploy#2 marker = it_remote@127.0.0.1' ($out2 -match 'SSH-ADDRESS: it_remote@127\.0\.0\.1')
+
+# 6c. REAL SSH login with password to the REAL network IP
+$sshOut = (& sshpass -p $Pass ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ('it_remote@' + $realIp) 'echo LAN-SSH-OK' 2>&1 | Out-String)
+Check 'REAL ssh login to real network IP (password auth)' ($sshOut -match 'LAN-SSH-OK') ($sshOut.Trim())
+
+# 6d. wrong password must fail
+$sshBad = (& sshpass -p 'Wrong-Pass-999' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 ('it_remote@' + $realIp) 'echo NOPE' 2>&1 | Out-String)
+Check 'ssh with wrong password is REJECTED' ($LASTEXITCODE -ne 0 -and $sshBad -notmatch 'NOPE')
+
 # ---------------- summary + report ----------------
 $passed = @($script:Results | Where-Object { $_.Ok }).Count
 $failed = @($script:Results | Where-Object { -not $_.Ok }).Count

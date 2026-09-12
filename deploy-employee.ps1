@@ -1,41 +1,39 @@
 <#
 .SYNOPSIS
-    One-time deployment script for employee machines. (v3 - cross-platform)
+    One-time deployment script for employee machines. (v4 - LAN mode)
 
     - Enables OpenSSH Server (sshd) with password auth, auto-start
       (Windows: OpenSSH capability + service; Linux: sshd binary + service)
     - Creates a local administrator account (default: it_remote)
-    - Installs/joins the Tailscale client (auto-reconnect, no public IP)
-    - Opens firewall port 22 on the Tailscale interface (Windows; Linux: skipped)
+    - Opens firewall port 22 for the local network (Private/Domain profiles)
+      and switches Public network profiles to Private
     - Writes the SSH address to <BaseDir>\ssh-address.txt and last-address.txt
     - Prints markers for the GUI wizard:
-          SSH-ADDRESS: ssh it_remote@pc-01.<tailnet>.ts.net
+          SSH-ADDRESS: it_remote@192.168.1.50
           [DEPLOY-STATUS] SUCCESS
 
     Console output is intentionally ASCII-English (readable in any encoding);
-    the full bilingual log is written to <BaseDir>\deploy.log.
+    the full log is written to <BaseDir>\deploy.log.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\deploy-employee.ps1 `
-        -TailscaleAuthKey "tskey-auth-XXXX" -AdminPassword "ChangeMe-Str0ng!" -Hostname "accounting-pc-01"
+        -AdminPassword "ChangeMe-Str0ng!" -Hostname "accounting-pc-01"
 
 .NOTES
     Run as Administrator (Windows) or root (Linux). Idempotent - safe to re-run.
     BaseDir: Windows = C:\ProgramData\RemoteAdmin
              Linux   = $HOME/.remote-admin   (override with $env:RA_BASEDIR)
-    Tailscale discovery: 'tailscale' in PATH first, then the Windows install path.
+    The SSH address is the machine's LAN IPv4 (the admin PC must be on the
+    same network / behind the same router).
 #>
 
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$TailscaleAuthKey,
-
     [Parameter(Mandatory = $true)]
     [string]$AdminPassword,
 
     [string]$Hostname = $env:COMPUTERNAME,
     [string]$UserName = 'it_remote',
-    [switch]$SkipTailscale,
+    [string]$LanIp = '',
     [switch]$AllowNonAdmin
 )
 
@@ -58,16 +56,41 @@ function Log {
     Write-Host $Message
     try { Add-Content -Path $LogFile -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
 }
-$script:HadWarnings = $false
 function LogWarn {
     param([string]$Message)
-    $script:HadWarnings = $true
     Log ('[WARNING] ' + $Message)
 }
 function Exit-Script {
     param([int]$Code, [string]$Mark)
     Log "[DEPLOY-STATUS] $Mark"
     exit $Code
+}
+
+function Get-LocalIp {
+    # Best-effort LAN IPv4 (default-route interface first). -LanIp overrides.
+    param([string]$Override)
+    if ($Override) { return $Override }
+    if ($IsWin) {
+        try {
+            $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                Sort-Object RouteMetric | Select-Object -First 1
+            if ($route) {
+                $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | Select-Object -First 1
+                if ($ip) { return [string]$ip.IPAddress }
+            }
+        } catch { }
+        $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -ne 'Loopback' -and $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+            Select-Object -First 1
+        if ($ip) { return [string]$ip.IPAddress }
+        return ''
+    }
+    $out = (& ip route get 1.1.1.1 2>$null | Select-Object -First 1)
+    if ($out -match 'src\s+(\d{1,3}(?:\.\d{1,3}){3})') { return $matches[1] }
+    $out = (& hostname -I 2>$null | Select-Object -First 1)
+    if ($out) { return ([string]$out).Trim().Split(' ')[0] }
+    return ''
 }
 
 try {
@@ -88,28 +111,12 @@ try {
         exit 1
     }
     New-Item -ItemType Directory -Force -Path $BaseDir | Out-Null
-    Log "= Remote Admin deploy v3 (OS: $(if ($IsWin) { 'Windows' } else { 'Unix' })) ="
+    Log '= Remote Admin deploy v4 (LAN mode) ='
 
     # ---------------------------------------------------------------
-    # 1. Auth key sanity check (catches the most common mistake)
+    # 1. OpenSSH Server (sshd)
     # ---------------------------------------------------------------
-    if (-not $SkipTailscale -and $TailscaleAuthKey -notmatch 'tskey') {
-        LogWarn ("The auth key does not look like a Tailscale key. Value starts with: {0}" -f $TailscaleAuthKey.Substring(0, [Math]::Min(20, $TailscaleAuthKey.Length)))
-        LogWarn 'Expected something like: tskey-auth-XXXXXXXXXXXXX  (generate it at login.tailscale.com/admin/settings/keys, tick Reusable)'
-    }
-
-    # --- Tailscale CLI discovery (PATH first, then Windows install path) ---
-    $tsExe = $null
-    $tsCmd = Get-Command tailscale -ErrorAction SilentlyContinue
-    if ($tsCmd) { $tsExe = $tsCmd.Source }
-    if (-not $tsExe -and $IsWin -and (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) {
-        $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
-    }
-
-    # ---------------------------------------------------------------
-    # 2. OpenSSH Server (sshd)
-    # ---------------------------------------------------------------
-    Log 'Step 1/5: OpenSSH Server ...'
+    Log 'Step 1/4: OpenSSH Server ...'
     if ($IsWin) {
         $sshdPresent = $false
         try { if (Get-Service -Name sshd -ErrorAction SilentlyContinue) { $sshdPresent = $true } } catch { }
@@ -152,9 +159,9 @@ try {
     }
 
     # ---------------------------------------------------------------
-    # 3. Remote administration account
+    # 2. Remote administration account
     # ---------------------------------------------------------------
-    Log ('Step 2/5: remote account {0} ...' -f $UserName)
+    Log ('Step 2/4: remote account {0} ...' -f $UserName)
     if ($IsWin) {
         $secPwd = ConvertTo-SecureString -String $AdminPassword -AsPlainText -Force
         if (Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue) {
@@ -191,147 +198,69 @@ try {
     }
 
     # ---------------------------------------------------------------
-    # 4. Tailscale
-    # ---------------------------------------------------------------
-    $tsOk = $false
-    if (-not $SkipTailscale) {
-        Log 'Step 3/5: Tailscale ...'
-        if (-not $tsExe -and $IsWin) {
-            $winget = Get-Command winget -ErrorAction SilentlyContinue
-            if ($winget) {
-                Log 'Installing Tailscale via winget...'
-                try {
-                    & winget install --id tailscale.tailscale -e --silent --accept-package-agreements --accept-source-agreements
-                    Start-Sleep -Seconds 5
-                } catch { LogWarn ("winget install: {0}" -f $_.Exception.Message) }
-            }
-            if (-not $tsExe) {
-                Log 'Winget not available, downloading Tailscale installer...'
-                try {
-                    Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup.exe' `
-                        -OutFile "$env:TEMP\tailscale-setup.exe" -UseBasicParsing
-                    Start-Process -FilePath "$env:TEMP\tailscale-setup.exe" -ArgumentList '/quiet', '/norestart' -Wait
-                } catch {
-                    LogWarn ("Tailscale auto-install failed: {0}" -f $_.Exception.Message)
-                    LogWarn 'Install Tailscale manually from https://tailscale.com/download/windows then re-run this script.'
-                }
-            }
-            $waitUntil = (Get-Date).AddMinutes(3)
-            while (-not $tsExe -and (Get-Date) -lt $waitUntil) {
-                Start-Sleep -Seconds 5
-                $c = Get-Command tailscale -ErrorAction SilentlyContinue
-                if ($c) { $tsExe = $c.Source }
-                if (-not $tsExe -and (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) { $tsExe = 'C:\Program Files\Tailscale\tailscale.exe' }
-            }
-        } elseif (-not $tsExe) {
-            LogWarn 'tailscale CLI not found - install Tailscale (https://tailscale.com/download) then re-run.'
-        }
-
-        if ($tsExe) {
-            $hostClean = ($Hostname -replace '[^a-zA-Z0-9-]', '-').ToLower()
-            Log ("Joining tailnet as host '{0}' ..." -f $hostClean)
-            & $tsExe up --authkey $TailscaleAuthKey --hostname $hostClean --accept-dns --timeout 90s
-            if ($LASTEXITCODE -ne 0) {
-                LogWarn ("tailscale up exited with code {0} - retrying once ..." -f $LASTEXITCODE)
-                Start-Sleep -Seconds 8
-                & $tsExe up --authkey $TailscaleAuthKey --hostname $hostClean --accept-dns --timeout 90s
-                if ($LASTEXITCODE -ne 0) {
-                    LogWarn 'tailscale up failed again. Check the auth key (must be tskey-auth-..., tick Reusable when creating it).'
-                } else { $tsOk = $true }
-            } else { $tsOk = $true }
-            if ($tsOk) { Log 'Tailscale is up (background service, auto-reconnects after reboot).' }
-        } else {
-            LogWarn 'Tailscale is not available - the SSH address will not be reachable from outside.'
-        }
-    } else {
-        Log 'Step 3/5: Tailscale skipped (-SkipTailscale).'
-    }
-
-    # ---------------------------------------------------------------
-    # 5. Firewall: inbound 22, prefer the Tailscale interface only
+    # 3. Firewall: inbound 22 on the local network (LAN mode)
     # ---------------------------------------------------------------
     if ($IsWin) {
-        Log 'Step 4/5: firewall ...'
+        Log 'Step 3/4: firewall (LAN) ...'
         try {
             Remove-NetFirewallRule -DisplayName 'OpenSSH Server (Tailscale only)' -ErrorAction SilentlyContinue
-            $onTs = $false
-            if (Get-NetAdapter -Name 'Tailscale' -ErrorAction SilentlyContinue) { $onTs = $true }
-            if ($onTs) {
-                New-NetFirewallRule -DisplayName 'OpenSSH Server (Tailscale only)' -Direction Inbound `
-                    -Protocol TCP -LocalPort 22 -Action Allow -InterfaceAlias 'Tailscale' -ErrorAction Stop | Out-Null
-                Log 'Firewall: port 22 allowed on the Tailscale interface only.'
-            } else {
-                New-NetFirewallRule -DisplayName 'OpenSSH Server (Tailscale only)' -Direction Inbound `
-                    -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction Stop | Out-Null
-                LogWarn 'Firewall: Tailscale adapter not found - port 22 allowed on ALL interfaces (tighten as soon as possible).'
-            }
+            Remove-NetFirewallRule -DisplayName 'OpenSSH Server (LAN)' -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName 'OpenSSH Server (LAN)' -Direction Inbound `
+                -Protocol TCP -LocalPort 22 -Action Allow -Profile Private, Domain -ErrorAction Stop | Out-Null
+            Log 'Firewall: port 22 allowed (Private/Domain profiles).'
         } catch { LogWarn ("Firewall rule failed: {0}" -f $_.Exception.Message) }
-    } else {
-        Log 'Step 4/5: firewall ... skipped (Windows-specific step; port 22 is governed by the OS firewall).'
-    }
-
-    # ---------------------------------------------------------------
-    # 6. Build the SSH address
-    # ---------------------------------------------------------------
-    Log 'Step 5/5: building SSH address ...'
-    $ip4 = ''; $tailnet = ''; $dnsName = ''
-    if ($tsExe) {
-        # 1) plain text command - the most reliable source of the tailnet IP
-        $ips = @(& $tsExe ip -4 2>$null | Where-Object { $_ -and $_.Trim() -ne '' })
-        if ($ips -and $ips.Count -gt 0) { $ip4 = [string]($ips[0]).Trim() }
-        # 2) JSON fallback (also gives the tailnet + DNS names)
         try {
-            $j = (& $tsExe status --json 2>$null | Out-String) | ConvertFrom-Json
-            if ($j) {
-                if ($j.CurrentTailnet) { $tailnet = [string]$j.CurrentTailnet.Name }
-                if ($j.Self) {
-                    if (-not $ip4 -and $j.Self.TailscaleIPs) { $ip4 = [string]@($j.Self.TailscaleIPs)[0] }
-                    if ($j.Self.DNSName) { $dnsName = ([string]$j.Self.DNSName).TrimEnd('.') }
-                }
+            $pubs = @(Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' })
+            foreach ($p in $pubs) {
+                Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private
+                Log ("network profile '{0}' switched Public -> Private (required for the firewall rule)." -f $p.Name)
             }
-        } catch { }
+        } catch { LogWarn ("Could not switch network profile to Private: {0}" -f $_.Exception.Message) }
+    } else {
+        Log 'Step 3/4: firewall ... skipped (Windows-specific step; port 22 is governed by the OS firewall).'
     }
 
+    # ---------------------------------------------------------------
+    # 4. Build the SSH address (LAN IP)
+    # ---------------------------------------------------------------
+    Log 'Step 4/4: building SSH address ...'
+    $ip4 = Get-LocalIp -Override $LanIp
     $hostLower = ($Hostname -replace '[^a-zA-Z0-9-]', '-').ToLower()
-    if (-not $dnsName) { $dnsName = "$hostLower.$tailnet" }
-    # SSH cannot parse '@' or spaces inside the host part -> fall back to the
-    # tailnet IP (this happens with email-style tailnets, e.g. user@gmail.com)
-    if ($dnsName -match '^[A-Za-z0-9.\-]+$') { $sshAddress = "$UserName@$dnsName" }
-    elseif ($ip4)                            { $sshAddress = "$UserName@$ip4" }
-    else                                     { $sshAddress = "$UserName@$hostLower" }
+    if ($ip4) { $sshAddress = "$UserName@$ip4" }
+    else {
+        LogWarn 'No LAN IPv4 found - falling back to the hostname (may not resolve).'
+        $sshAddress = "$UserName@$hostLower"
+    }
 
     $summary = @(
         '===================================================================='
         ('  REMOTE SSH ADDRESS  ->   ssh {0}' -f $sshAddress)
-        ('  IP fallback        ->   ssh {0}@{1}' -f $UserName, $ip4)
+        ('  Alternative (name)  ->   ssh {0}@{1}   (works if the name resolves)' -f $UserName, $hostLower)
         ('  User / Password    ->   {0} / <the AdminPassword you entered>' -f $UserName)
-        '  From YOUR machine (Tailscale logged in), run get-addresses.ps1 or open AdminConsole.'
+        '  Both PCs must be on the SAME local network (same router).'
+        '  From YOUR machine: run AdminConsole (refresh) or scan-network.ps1.'
         '===================================================================='
     )
     foreach ($s in $summary) { Log $s }
 
     Write-Host ('SSH-ADDRESS: {0}' -f $sshAddress)
-    Write-Host ('IP-FALLBACK: {0}' -f "$UserName@$ip4")
+    Write-Host ('IP-FALLBACK: {0}' -f $sshAddress)
 
     Set-Content -Path $AddrFile -Encoding UTF8 -Value @(
         "SSH-ADDRESS: ssh $sshAddress"
-        "IP fallback: ssh $UserName@$ip4"
-        "DNS name:    $dnsName"
+        "IP fallback: ssh $sshAddress"
         "Hostname:    $hostLower"
         "User:        $UserName"
-        "Tailnet:     $tailnet"
         "Log:         $LogFile"
     )
-    # single-line file with ONLY the usable address - easy to read programmatically
     Set-Content -Path (Join-Path $BaseDir 'last-address.txt') -Encoding UTF8 -Value ("ssh {0}" -f $sshAddress)
 
-    if ($tsOk -or $SkipTailscale) {
+    if ($ip4) {
         Log 'Deployment complete.'
         Exit-Script -Code 0 -Mark 'SUCCESS'
     } else {
-        LogWarn 'Tailscale did NOT join the tailnet - the SSH address will NOT be reachable from outside.'
-        LogWarn 'Fix the auth key (tskey-auth-..., Reusable ticked) and re-run, or install Tailscale manually.'
-        Exit-Script -Code 1 -Mark 'FAILED : tailscale did not join the tailnet'
+        LogWarn 'No LAN IPv4 was found - the address may not be reachable.'
+        Exit-Script -Code 1 -Mark 'FAILED : no LAN IPv4 found'
     }
 
 } catch {
