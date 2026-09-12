@@ -172,6 +172,13 @@ Check 'REAL ssh login to real network IP (password auth)' ($sshOut -match 'LAN-S
 $sshBad = (& sshpass -p 'Wrong-Pass-999' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 ('it_remote@' + $realIp) 'echo NOPE' 2>&1 | Out-String)
 Check 'ssh with wrong password is REJECTED' ($LASTEXITCODE -ne 0 -and $sshBad -notmatch 'NOPE')
 
+# ---------------- TEST 7: wizard is Tailscale-free ----------------
+$wizText = (Get-Content -Path $Wizard -Raw)
+Check 'wizard: no Tailscale auth-key field'      ($wizText -notmatch 'RA_KEY')
+Check 'wizard: no tskey references'              ($wizText -notmatch 'tskey')
+Check 'wizard: no TailscaleAuthKey references'   ($wizText -notmatch 'TailscaleAuthKey')
+Check 'wizard: still runs deploy with password'  ($wizText -match 'RA_PASS' -and $wizText -match '-AdminPassword')
+
 # ---------------- summary + report ----------------
 $passed = @($script:Results | Where-Object { $_.Ok }).Count
 $failed = @($script:Results | Where-Object { -not $_.Ok }).Count

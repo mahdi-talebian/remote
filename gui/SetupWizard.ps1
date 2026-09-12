@@ -1,8 +1,8 @@
 ﻿<#
 .SYNOPSIS
-    GUI setup wizard (employee side, one-time). v2
+    GUI setup wizard (employee side, one-time). v3 (LAN mode)
 
-    - Validates the Tailscale auth key (must be tskey-auth-..., NOT a *.ts.net address)
+    - Validates the hostname and password
     - Runs deploy-employee.ps1 with live log (read from file - reliable)
     - Shows the SSH address on success; shows the exact error tail on failure
 
@@ -96,7 +96,7 @@ $layout = New-Object System.Windows.Forms.TableLayoutPanel
 $layout.Dock = 'Fill'; $layout.ColumnCount = 1; $layout.RowCount = 5
 $layout.BackColor = $cBg
 $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 60)))   | Out-Null
-$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 210))) | Out-Null
+$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 170))) | Out-Null
 $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))  | Out-Null
 $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))   | Out-Null
 $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 58)))   | Out-Null
@@ -120,34 +120,29 @@ $group.ForeColor = $cText
 $group.Padding = New-Object System.Windows.Forms.Padding(16, 10, 16, 6)
 
 $lblHost = New-Object System.Windows.Forms.Label
-$lblHost.Text = 'نام دستگاه (برای آدرس SSH):'; $lblHost.AutoSize = $true; $lblHost.Location = New-Object System.Drawing.Point(470, 30)
+$lblHost.Text = 'نام دستگاه (برای نمایش در فهرست):'; $lblHost.AutoSize = $true; $lblHost.Location = New-Object System.Drawing.Point(440, 30)
 $txtHost = New-Object System.Windows.Forms.TextBox
 $txtHost.Text = $env:COMPUTERNAME; $txtHost.Location = New-Object System.Drawing.Point(200, 27); $txtHost.Width = 260
 $txtHost.RightToLeft = 'No'; $txtHost.Font = $fMono
 
-$lblKey = New-Object System.Windows.Forms.Label
-$lblKey.Text = 'کلید احراز هویت Tailscale:'; $lblKey.AutoSize = $true; $lblKey.Location = New-Object System.Drawing.Point(452, 64)
-$txtKey = New-Object System.Windows.Forms.TextBox
-$txtKey.Location = New-Object System.Drawing.Point(200, 61); $txtKey.Width = 480; $txtKey.RightToLeft = 'No'; $txtKey.Font = $fMono
-
 $lblPass = New-Object System.Windows.Forms.Label
-$lblPass.Text = 'رمز عبور مدیر (it_remote):'; $lblPass.AutoSize = $true; $lblPass.Location = New-Object System.Drawing.Point(440, 98)
+$lblPass.Text = 'رمز عبور مدیر (it_remote):'; $lblPass.AutoSize = $true; $lblPass.Location = New-Object System.Drawing.Point(440, 64)
 $txtPass = New-Object System.Windows.Forms.TextBox
-$txtPass.Location = New-Object System.Drawing.Point(200, 95); $txtPass.Width = 480
+$txtPass.Location = New-Object System.Drawing.Point(200, 61); $txtPass.Width = 480
 $txtPass.UseSystemPasswordChar = $true; $txtPass.RightToLeft = 'No'
 
 $lblPass2 = New-Object System.Windows.Forms.Label
-$lblPass2.Text = 'تکرار رمز عبور:'; $lblPass2.AutoSize = $true; $lblPass2.Location = New-Object System.Drawing.Point(492, 132)
+$lblPass2.Text = 'تکرار رمز عبور:'; $lblPass2.AutoSize = $true; $lblPass2.Location = New-Object System.Drawing.Point(492, 98)
 $txtPass2 = New-Object System.Windows.Forms.TextBox
-$txtPass2.Location = New-Object System.Drawing.Point(200, 129); $txtPass2.Width = 480
+$txtPass2.Location = New-Object System.Drawing.Point(200, 95); $txtPass2.Width = 480
 $txtPass2.UseSystemPasswordChar = $true; $txtPass2.RightToLeft = 'No'
 
 $chkShow = New-Object System.Windows.Forms.CheckBox
 $chkShow.Text = 'نمایش رمز عبور'; $chkShow.AutoSize = $true
-$chkShow.Location = New-Object System.Drawing.Point(200, 162)
+$chkShow.Location = New-Object System.Drawing.Point(200, 129)
 $chkShow.ForeColor = $cGray
 
-foreach ($c in @($lblHost, $txtHost, $lblKey, $txtKey, $lblPass, $txtPass, $lblPass2, $txtPass2, $chkShow)) {
+foreach ($c in @($lblHost, $txtHost, $lblPass, $txtPass, $lblPass2, $txtPass2, $chkShow)) {
     $group.Controls.Add($c)
 }
 $layout.Controls.Add($group, 0, 1)
@@ -266,11 +261,8 @@ function Show-FinalError {
         'استقرار با خطا پایان یافت (کد خروج: ' + $ExitCode + ').' + [Environment]::NewLine + [Environment]::NewLine +
         'آخرین خروجی:' + [Environment]::NewLine + $tail + [Environment]::NewLine + [Environment]::NewLine +
         'رایج ترین دلایل:' + [Environment]::NewLine +
-        '1) کلید Tailscale معتبر نیست - باید با tskey-auth- شروع شود' + [Environment]::NewLine +
-        '   (login.tailscale.com/admin/settings/keys - گزینه Reusable فعال باشد)' + [Environment]::NewLine +
-        '2) اینترنت محدود است و Tailscale نصب نشده است' + [Environment]::NewLine +
-        '   (نصب دستی از tailscale.com/download/windows و اجرای دوباره)' + [Environment]::NewLine +
-        '3) متن کامل خطا را کپی کنید و برای پشتیبانی بفرستید',
+        '1) فایروال/آنتی‌ویروس مانع نصب یا اجرای OpenSSH Server شده است' + [Environment]::NewLine +
+        '2) متن کامل خطا را کپی کنید و برای پشتیبانی بفرستید',
         'خطا', 'OK', 'Error') | Out-Null
 }
 
@@ -307,7 +299,6 @@ $pollTimer.Interval = 400
 
 function Start-Deployment {
     $hostName = $txtHost.Text.Trim()
-    $authKey  = $txtKey.Text.Trim()
     $pass1    = $txtPass.Text
     $pass2    = $txtPass2.Text
 
@@ -316,25 +307,6 @@ function Start-Deployment {
         [System.Windows.Forms.MessageBox]::Show(
             'نام دستگاه نامعتبر است. فقط حروف انگلیسی، عدد و خط تیره (حداکثر 63 کاراکتر).',
             'اعتبارسنجی', 'OK', 'Warning') | Out-Null
-        return
-    }
-    if ($authKey -eq '') {
-        [System.Windows.Forms.MessageBox]::Show(
-            'کلید احراز هویت Tailscale را وارد کنید.' + [Environment]::NewLine + [Environment]::NewLine +
-            'از این صفحه بگیرید: login.tailscale.com/admin/settings/keys' + [Environment]::NewLine +
-            'و گزینه Reusable را فعال کنید.',
-            'اعتبارسنجی', 'OK', 'Warning') | Out-Null
-        return
-    }
-    if ($authKey -notmatch '^tskey-auth-') {
-        [System.Windows.Forms.MessageBox]::Show(
-            'مقدار وارد شده کلید معتبر Tailscale نیست.' + [Environment]::NewLine + [Environment]::NewLine +
-            'کلید باید این شکلی باشد:' + [Environment]::NewLine +
-            'tskey-auth-XXXXXXXXXXXXXX' + [Environment]::NewLine + [Environment]::NewLine +
-            'نکته: آدرس دستگاه ها (مثل xxx.ts.net) کلید نیست!' + [Environment]::NewLine +
-            'محل درست ساخت کلید:' + [Environment]::NewLine +
-            'login.tailscale.com/admin/settings/keys  ->  Generate auth key  ->  تیک Reusable',
-            'کلید نامعتبر', 'OK', 'Warning') | Out-Null
         return
     }
     if ($pass1.Length -lt 8) {
@@ -383,13 +355,12 @@ function Start-Deployment {
     # --- launch ---
     # Arguments are passed via environment variables + -EncodedCommand so that
     # ANY password/path (even with spaces or quotes) is transmitted safely.
-    $env:RA_KEY  = $authKey
     $env:RA_PASS = $pass1
     $env:RA_HOST = $hostName
     $inner = @(
         '$WarningPreference = ''SilentlyContinue'''
         '$ProgressPreference = ''SilentlyContinue'''
-        '& "{0}" -TailscaleAuthKey $env:RA_KEY -AdminPassword $env:RA_PASS -Hostname $env:RA_HOST' -f $deployScript
+        '& "{0}" -AdminPassword $env:RA_PASS -Hostname $env:RA_HOST' -f $deployScript
     ) -join [Environment]::NewLine
     $b64   = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
     try {
@@ -401,7 +372,7 @@ function Start-Deployment {
         $script:Proc = $p
         $pollTimer.Start()
     } catch {
-        $env:RA_KEY = $null; $env:RA_PASS = $null; $env:RA_HOST = $null
+        $env:RA_PASS = $null; $env:RA_HOST = $null
         Add-LogText ('ERROR starting the deploy script: ' + $_.Exception.Message)
         $group.Enabled = $true; $btnRun.Enabled = $true; $btnClose.Enabled = $true
         $progress.Style = 'Blocks'; $progress.Value = 0
@@ -488,7 +459,7 @@ $pollTimer.Add_Tick({
         Show-FinalError -ExitCode $exitCode -TailLines $all
     }
 
-    $env:RA_KEY = $null; $env:RA_PASS = $null; $env:RA_HOST = $null
+    $env:RA_PASS = $null; $env:RA_HOST = $null
     Remove-Item $script:OutFile, $script:ErrFile -Force -ErrorAction SilentlyContinue
 })
 
