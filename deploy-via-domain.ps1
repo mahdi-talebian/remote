@@ -9,20 +9,17 @@
         Enable-PSRemoting -SkipNetworkProfileCheck)
       - Your credentials are an administrator on those machines
     Alternative without WinRM: use PsExec (sysinternals):
-      psexec \\pc-01 -s -i powershell -ExecutionPolicy Bypass -File C:\deploy-employee.ps1 -TailscaleAuthKey tskey-auth-... -AdminPassword '...'
+      psexec \\pc-01 -s -i powershell -ExecutionPolicy Bypass -File C:\deploy-employee.ps1 -AdminPassword '...'
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\deploy-via-domain.ps1 `
         -ComputerNames pc-01,pc-02,pc-03 `
-        -TailscaleAuthKey "tskey-auth-XXXX" -AdminPassword "ChangeMe-Str0ng!"
+        -AdminPassword "ChangeMe-Str0ng!"
 #>
 
 param(
     [Parameter(Mandatory = $true)]
     [string[]]$ComputerNames,
-
-    [Parameter(Mandatory = $true)]
-    [string]$TailscaleAuthKey,
 
     [Parameter(Mandatory = $true)]
     [string]$AdminPassword,
@@ -37,7 +34,7 @@ foreach ($c in $ComputerNames) {
     try {
         $common = @{ ComputerName = $c; FilePath = $script; ErrorAction = 'Stop' }
         if ($Credential) { $common.Credential = $Credential }
-        Invoke-Command @common -ArgumentList $TailscaleAuthKey, $AdminPassword
+        Invoke-Command @common -ArgumentList $AdminPassword
         Write-Host ("{0}: OK" -f $c) -ForegroundColor Green
     } catch {
         Write-Warning ("{0}: {1}" -f $c, $_.Exception.Message)

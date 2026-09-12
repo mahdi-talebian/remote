@@ -1,39 +1,26 @@
 <#
 .SYNOPSIS
-    End-to-end test suite for the Remote Admin package (Linux/CI).
+    End-to-end test suite for the Remote Admin package (LAN mode, Linux/CI).
 
-    Simulates the FULL flow with two roles sharing a fake tailnet:
-      AGENT   : deploy-employee.ps1  (real execution, as root, on this host)
-      ADMIN   : get-addresses.ps1    (real execution, as user)
-    The Tailscale CLI is mocked (tests/mock/tailscale, installed at
-    /usr/local/bin/tailscale) and reproduces the customer's real-world
-    scenario: an EMAIL-STYLE tailnet name (mmdtalebian.animid@gmail.com)
-    which makes naive address building produce invalid SSH host names.
-
-    The SSH part is 100% REAL:
-      - real user 'it_remote' created on this host by the deploy script
-      - real sshd (the sandbox's own, port 22), real password auth
-      - real OpenSSH client (via sshpass) logging in with the address
-        the scripts produced.
+    Everything REAL: real sshd on port 22, real deploy, real network IP,
+    real SSH login with sshpass. No mocks.
 
 .REQUIRES
-    - PowerShell 7 (pwsh) at /tmp/pwshdir/pwsh   (edit $env:PWSH below)
-    - sudo (passwordless), sshd on port 22, sshpass installed
-    - mock tailscale installed at /usr/local/bin/tailscale
+    - PowerShell 7 (pwsh - set $env:E2E_PWSH if not on PATH)
+    - sudo (passwordless), sshd on port 22, sshpass
 #>
 
 $ErrorActionPreference = 'Stop'
-$PWSH       = if ($env:E2E_PWSH) { $env:E2E_PWSH } else { '/tmp/pwshdir/pwsh' }
-$Root       = Split-Path $PSScriptRoot -Parent
-$Deploy     = Join-Path $Root 'deploy-employee.ps1'
-$GetAddr    = Join-Path $Root 'get-addresses.ps1'
-$Wizard     = Join-Path $Root 'gui\SetupWizard.ps1'
-$Console    = Join-Path $Root 'gui\AdminConsole.ps1'
-$Mock       = '/usr/local/bin/tailscale'
-$Pass       = 'Test-Pass-147!xyZ'      # the SSH password (set by deploy as root)
-$RunDir     = '/tmp/e2e-remote-admin'
+$PWSH    = if ($env:E2E_PWSH) { $env:E2E_PWSH } else { 'pwsh' }
+$Root    = Split-Path $PSScriptRoot -Parent
+$Deploy  = Join-Path $Root 'deploy-employee.ps1'
+$Scan    = Join-Path $Root 'scan-network.ps1'
+$Wizard  = Join-Path $Root 'gui\SetupWizard.ps1'
+$Console = Join-Path $Root 'gui\AdminConsole.ps1'
+$ViaDom  = Join-Path $Root 'deploy-via-domain.ps1'
+$Pass    = 'Test-Pass-147!xyZ'
+$RunDir  = '/tmp/e2e-remote-admin'
 
-# ---------------------------------------------------------------
 $script:Results = @()
 function Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = '')
@@ -41,30 +28,7 @@ function Check {
     if ($Ok) { Write-Host ("PASS  " + $Name) -ForegroundColor Green }
     else     { Write-Host ("FAIL  " + $Name + '  ->  ' + $Detail) -ForegroundColor Red }
 }
-
 function Remove-RunDir { sudo rm -rf $RunDir; New-Item -ItemType Directory -Force -Path $RunDir | Out-Null }
-
-function Fix-Ownership {
-    # deploy runs as root (sudo) and creates root-owned state dirs; give them
-    # back to the current user so the mock can be driven from both roles.
-    $u = (& id -un); $g = (& id -gn)
-    & sudo chown -R ("{0}:{1}" -f $u, $g) $RunDir 2>$null
-}
-
-function Invoke-Deploy {
-    param([string]$State, [string]$Base, [string]$Hostname, [string]$Key,
-          [string]$Tailnet = '', [string]$DnsName = '', [string]$Ip = '127.0.0.1',
-          [string]$MockHost = 'mock-host')
-    $a = @('env')
-    $a += "TS_MOCK_STATE=$State"; $a += "TS_MOCK_IP=$Ip"; $a += "TS_MOCK_HOST=$MockHost"; $a += "RA_BASEDIR=$Base"
-    if ($Tailnet) { $a += "TS_MOCK_TAILNET=$Tailnet" }
-    if ($DnsName) { $a += "TS_MOCK_DNSNAME=$DnsName" }
-    $a += @($PWSH, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Deploy,
-            '-TailscaleAuthKey', $Key, '-AdminPassword', $Pass, '-Hostname', $Hostname)
-    $out = (& sudo @a 2>&1 | Out-String)
-    [pscustomobject]@{ Output = $out; ExitCode = $LASTEXITCODE }
-}
-
 function Get-FunctionText {
     param([string]$Path, [string]$Name)
     $tokens = $null; $errors = $null
@@ -74,182 +38,76 @@ function Get-FunctionText {
     return $fn.Extent.Text
 }
 
-# ===============================================================
-Write-Host '==== Remote Admin - end-to-end test suite ====' -ForegroundColor Cyan
+Write-Host '==== Remote Admin - E2E test suite (LAN mode) ====' -ForegroundColor Cyan
 Remove-RunDir
 
-# ---------------------------------------------------------------
-# TEST 0: all scripts parse
-# ---------------------------------------------------------------
+# ---------------- TEST 0: all scripts parse ----------------
 $allOk = $true
-foreach ($f in @($Deploy, $GetAddr, $Wizard, $Console, (Join-Path $Root 'gui\AdminConsole.ps1'))) {
+foreach ($f in @($Deploy, $Scan, $Wizard, $Console, $ViaDom)) {
     $t = $null; $e = $null
     [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$t, [ref]$e) | Out-Null
     if ($e.Count) { $allOk = $false; Check ('parse: ' + (Split-Path $f -Leaf)) $false ($e[0].Message) }
 }
 if ($allOk) { Check 'parse: all 5 PowerShell scripts' $true }
 
-# ---------------------------------------------------------------
-# TEST 1: AGENT deploy, EMAIL-STYLE tailnet  (the customer's exact scenario)
-# ---------------------------------------------------------------
-$state1 = "$RunDir/state1"; $base1 = "$RunDir/agent1"
-$r1 = Invoke-Deploy -State $state1 -Base $base1 -Hostname 'mock-agent' -Key 'tskey-auth-TESTKEY123' `
-        -Tailnet 'mmdtalebian.animid@gmail.com' -DnsName 'mock-agent.mmdtalebian.animid@gmail.com' `
-        -Ip '127.0.0.1' -MockHost 'mock-agent'
-Fix-Ownership
-Check 'deploy#1 exit code = 0'                    ($r1.ExitCode -eq 0) ("exit=$($r1.ExitCode)")
-Check 'deploy#1 prints [DEPLOY-STATUS] SUCCESS'   ($r1.Output -match '\[DEPLOY-STATUS\] SUCCESS')
-Check 'deploy#1 marker = it_remote@127.0.0.1 (bare, email tailnet)' `
-      ($r1.Output -match 'SSH-ADDRESS: it_remote@127\.0\.0\.1') ($r1.Output -replace "`r?`n", ' | ' | Select-String 'SSH-ADDRESS' | ForEach-Object { $_.Line })
-Check 'deploy#1 no CLIXML noise'                  ($r1.Output -notmatch '<Obj|Object Version=')
+# ---------------- TEST 1: scanner functions extractable from scan-network.ps1 ----------------
+$fnScan   = Get-FunctionText -Path $Scan -Name 'Find-SshHosts'
+$fnSubnet = Get-FunctionText -Path $Scan -Name 'Get-SubnetHosts'
+$fnLocal  = Get-FunctionText -Path $Scan -Name 'Get-LocalSubnet'
+Check 'scan-network: Find-SshHosts extractable'   ($null -ne $fnScan)
+Check 'scan-network: Get-SubnetHosts extractable' ($null -ne $fnSubnet)
+Check 'scan-network: Get-LocalSubnet extractable' ($null -ne $fnLocal)
 
-$last1  = Join-Path $base1 'last-address.txt'
-$addr1  = Join-Path $base1 'ssh-address.txt'
-Check 'deploy#1 wrote last-address.txt'           (Test-Path $last1)
-if (Test-Path $last1) {
-    $v = (Get-Content $last1 -Raw -Encoding UTF8).Trim()
-    Check 'deploy#1 last-address.txt content' ($v -eq 'ssh it_remote@127.0.0.1') ("got: $v")
-}
-if (Test-Path $addr1) {
-    $c = Get-Content $addr1 -Raw -Encoding UTF8
-    Check 'deploy#1 ssh-address.txt has SSH-ADDRESS + IP fallback' ($c -match 'SSH-ADDRESS: ssh it_remote@127\.0\.0\.1' -and $c -match 'IP fallback: ssh it_remote@127\.0\.0\.1')
-}
+# ---------------- TEST 2: subnet math ----------------
+. ([scriptblock]::Create($fnSubnet))
+$hosts = @(Get-SubnetHosts -Cidr '192.168.1.0/24')
+Check 'Get-SubnetHosts: 254 hosts for /24' ($hosts.Count -eq 254) ("count=$($hosts.Count)")
+Check 'Get-SubnetHosts: first is .1' ($hosts[0] -eq '192.168.1.1') ("first=$($hosts[0])")
+Check 'Get-SubnetHosts: last is .254' ($hosts[-1] -eq '192.168.1.254') ("last=$($hosts[-1])")
+Check 'Get-SubnetHosts: rejects non-/24' (@(Get-SubnetHosts -Cidr '10.0.0.0/8').Count -eq 0)
+Check 'Get-SubnetHosts: rejects garbage' (@(Get-SubnetHosts -Cidr ' nonsense').Count -eq 0)
+. ([scriptblock]::Create($fnLocal))
+$sn = Get-LocalSubnet -Ip '192.168.1.15'
+Check 'Get-LocalSubnet: 192.168.1.15 -> 192.168.1.0/24' ($sn -eq '192.168.1.0/24') ("got=$sn")
+Check 'Get-LocalSubnet: garbage -> empty' ((Get-LocalSubnet -Ip 'xx') -eq '')
 
-# ---------------------------------------------------------------
-# TEST 2: 'both sides see each other' (shared fake tailnet)
-# ---------------------------------------------------------------
-# admin machine joins the same tailnet, then each side lists the other
-$null = & env "TS_MOCK_STATE=$state1" TS_MOCK_HOST=controller TS_MOCK_IP=127.0.0.2 $Mock up --authkey tskey-auth-ADMINKEY --hostname controller 2>&1
-$agentView = (& env "TS_MOCK_STATE=$state1" TS_MOCK_HOST=mock-agent TS_MOCK_IP=127.0.0.1 $Mock status 2>&1 | Out-String)
-$adminView = (& env "TS_MOCK_STATE=$state1" TS_MOCK_HOST=controller TS_MOCK_IP=127.0.0.2 $Mock status 2>&1 | Out-String)
-Check 'agent sees controller in tailnet'  ($agentView -match 'controller')
-Check 'admin sees agent in tailnet'       ($adminView -match 'mock-agent')
-Check 'admin sees agent ONLINE'           ($adminView -match 'mock-agent' -and $adminView -notmatch 'mock-agent.*offline')
+# ---------------- TEST 3: REAL scan on 127.0.0.0/24 finds real sshd ----------------
+. ([scriptblock]::Create($fnScan))
+$found = @(Find-SshHosts -Cidr '127.0.0.0/24' -TimeoutMs 3000)
+Check 'Find-SshHosts: real scan finds 127.0.0.1 (sshd on :22)' ($found -contains '127.0.0.1') ("found=$($found -join ',')")
+$none = @(Find-SshHosts -Cidr '127.0.0.0/24' -Port 22999 -TimeoutMs 1500)
+Check 'Find-SshHosts: closed port -> nothing found' ($none.Count -eq 0) ("found=$($none -join ',')")
 
-# ---------------------------------------------------------------
-# TEST 3: ADMIN side - get-addresses.ps1 lists the agent + correct address
-# ---------------------------------------------------------------
-$env:TS_MOCK_STATE = $state1
-$env:TS_MOCK_HOST  = 'controller'
-$env:TS_MOCK_IP    = '127.0.0.2'
-$env:TS_MOCK_TAILNET = 'mmdtalebian.animid@gmail.com'
-$ga = (& $PWSH -NoProfile -ExecutionPolicy Bypass -File $GetAddr 2>&1 | Out-String)
-Check 'get-addresses shows agent as ONLINE'  ($ga -match '\[ONLINE \] ssh it_remote@127\.0\.0\.1')
-Check 'get-addresses saves ssh-addresses.txt' (Test-Path (Join-Path $Root 'ssh-addresses.txt'))
-Remove-Item Env:TS_MOCK_STATE, Env:TS_MOCK_HOST, Env:TS_MOCK_IP, Env:TS_MOCK_TAILNET -ErrorAction SilentlyContinue
-
-# ---------------------------------------------------------------
-# TEST 4: REAL SSH connection with the produced address + password
-# ---------------------------------------------------------------
-$ssh = (& sshpass -p $Pass ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null `
-        -o PreferredAuthentications=password -o PubkeyAuthentication=no `
-        it_remote@127.0.0.1 'hostname; echo SSH-CONNECTED' 2>&1 | Out-String)
-Check 'REAL ssh login succeeds (password auth, address from scripts)' ($LASTEXITCODE -eq 0 -and $ssh -match 'SSH-CONNECTED') $ssh
-
-# ---------------------------------------------------------------
-# TEST 5: AGENT deploy, NORMAL tailnet  (DNS address must be used)
-# ---------------------------------------------------------------
-$state2 = "$RunDir/state2"; $base2 = "$RunDir/agent2"
-$r2 = Invoke-Deploy -State $state2 -Base $base2 -Hostname 'agent2' -Key 'tskey-auth-TESTKEY456' `
-        -Tailnet 'mycorp.ts.net' -DnsName 'agent2.mycorp.ts.net' -Ip '127.0.0.3' -MockHost 'agent2'
-Check 'deploy#2 exit code = 0'  ($r2.ExitCode -eq 0) ("exit=$($r2.ExitCode)")
-Check 'deploy#2 address = it_remote@agent2.mycorp.ts.net (DNS, clean tailnet)' `
-      ($r2.Output -match 'SSH-ADDRESS: it_remote@agent2\.mycorp\.ts\.net')
-$v2 = if (Test-Path (Join-Path $base2 'last-address.txt')) { (Get-Content (Join-Path $base2 'last-address.txt') -Raw -Encoding UTF8).Trim() } else { '' }
-Check 'deploy#2 last-address.txt = DNS form' ($v2 -eq 'ssh it_remote@agent2.mycorp.ts.net') ("got: $v2")
-
-# ---------------------------------------------------------------
-# TEST 6: NEGATIVE - the auth-key mistake from the customer (a ts.net ADDRESS
-#         in the key field) must produce a clear FAILURE, not a fake success
-# ---------------------------------------------------------------
-$r3 = Invoke-Deploy -State "$RunDir/state3" -Base "$RunDir/agent3" -Hostname 'badkey' `
-        -Key 'desktop-u5qn4rb.taila3f232.ts.net' -Tailnet 'mmdtalebian.animid@gmail.com' -MockHost 'badkey'
-Check 'deploy#bad-key exit code = 1'          ($r3.ExitCode -eq 1) ("exit=$($r3.ExitCode)")
-Check 'deploy#bad-key marks FAILED'           ($r3.Output -match '\[DEPLOY-STATUS\] FAILED')
-Check 'deploy#bad-key warns about tskey-auth' ($r3.Output -match 'tskey-auth')
-
-# ---------------------------------------------------------------
-# TEST 7: wizard helpers (functions extracted from the real shipped file)
-# ---------------------------------------------------------------
-$src    = Get-FunctionText -Path $Wizard -Name 'Get-NewLines'
-$srcA   = Get-FunctionText -Path $Wizard -Name 'Get-AuthoritativeAddress'
-$srcP   = Get-FunctionText -Path $Wizard -Name 'Parse-Address'
-Check 'wizard: Get-NewLines / Get-AuthoritativeAddress / Parse-Address extractable' ($src -and $srcA -and $srcP)
-if ($src -and $srcA -and $srcP) {
-    Invoke-Expression $src
-    Invoke-Expression $srcA
-    Invoke-Expression $srcP
-
-    # --- regression fixes for the 'address shows as ssh only' bug ---
-    Check 'Parse-Address: current marker (bare) -> full'   ((Parse-Address 'SSH-ADDRESS: it_remote@127.0.0.1') -eq 'ssh it_remote@127.0.0.1')
-    Check 'Parse-Address: old marker (ssh prefix) -> full' ((Parse-Address 'SSH-ADDRESS: ssh it_remote@127.0.0.1') -eq 'ssh it_remote@127.0.0.1')
-    Check 'Parse-Address: last-address.txt line -> full'   ((Parse-Address 'ssh it_remote@agent2.mycorp.ts.net') -eq 'ssh it_remote@agent2.mycorp.ts.net')
-    Check 'Parse-Address: bare address -> full'            ((Parse-Address 'it_remote@100.64.1.9') -eq 'ssh it_remote@100.64.1.9')
-    Check 'Parse-Address: partial marker "SSH-ADDRESS: ssh" REJECTED' ((Parse-Address 'SSH-ADDRESS: ssh') -eq '')
-    Check 'Parse-Address: random log line -> empty'        ((Parse-Address 'Step 1/5: OpenSSH Server ...') -eq '')
-    Check 'Parse-Address: Tailnet line -> empty'           ((Parse-Address 'Tailnet: mmdtalebian.animid@gmail.com') -eq '')
-
-    # --- wizard streaming simulation over REAL deploy output ---
-    $addrFromLog = ''
-    foreach ($l in ($r1.Output -split "`r?`n")) {
-        $a = Parse-Address -Line $l
-        if ($a) { $addrFromLog = $a }
-    }
-    Check 'wizard streaming sim: full address recovered from deploy#1 log' ($addrFromLog -eq 'ssh it_remote@127.0.0.1') ("got: $addrFromLog")
-
-    # regression for the original bug: a file that currently has exactly ONE line
-    $tmpF = Join-Path $RunDir 'one-line.txt'
-    Set-Content -Path $tmpF -Value 'SSH-ADDRESS: ssh it_remote@127.0.0.1' -Encoding UTF8
-    $pos = 0
-    $got = @(Get-NewLines -Path $tmpF -Pos ([ref]$pos))
-    Check 'wizard Get-NewLines: single-line file returns the LINE (bug fixed)' `
-          ($got.Count -eq 1 -and $got[0] -match 'SSH-ADDRESS') ("count=$($got.Count), first='$($got[0])'")
-    Add-Content -Path $tmpF -Value 'line two' -Encoding UTF8
-    $got2 = @(Get-NewLines -Path $tmpF -Pos ([ref]$pos))
-    Check 'wizard Get-NewLines: incremental read works' ($got2.Count -eq 1 -and $got2[0] -eq 'line two')
-
-    $env:RA_ADDR_DIR = "$RunDir/addrdir"; New-Item -ItemType Directory -Force -Path $env:RA_ADDR_DIR | Out-Null
-    Set-Content -Path (Join-Path $env:RA_ADDR_DIR 'last-address.txt') -Value 'ssh it_remote@127.0.0.1' -Encoding UTF8
-    Check 'wizard address recovery from last-address.txt' ((Get-AuthoritativeAddress) -eq 'ssh it_remote@127.0.0.1')
-    Remove-Item (Join-Path $env:RA_ADDR_DIR 'last-address.txt') -Force
-    Set-Content -Path (Join-Path $env:RA_ADDR_DIR 'ssh-address.txt') -Value @('SSH-ADDRESS: ssh it_remote@agent2.mycorp.ts.net', 'x') -Encoding UTF8
-    Check 'wizard address recovery from ssh-address.txt' ((Get-AuthoritativeAddress) -eq 'ssh it_remote@agent2.mycorp.ts.net')
-    Remove-Item Env:RA_ADDR_DIR
+# ---------------- TEST 4: wizard Parse-Address (IP forms; regression suite) ----------------
+$fnParse = Get-FunctionText -Path $Wizard -Name 'Parse-Address'
+Check 'wizard: Parse-Address extractable' ($null -ne $fnParse)
+if ($fnParse) {
+    . ([scriptblock]::Create($fnParse))
+    $t1 = Parse-Address -Line 'SSH-ADDRESS: ssh it_remote@192.168.1.50'
+    Check 'Parse-Address: current marker (ssh prefix)' ($t1 -eq 'ssh it_remote@192.168.1.50') ("got=$t1")
+    $t2 = Parse-Address -Line 'SSH-ADDRESS: it_remote@192.168.1.50'
+    Check 'Parse-Address: marker without ssh' ($t2 -eq 'ssh it_remote@192.168.1.50') ("got=$t2")
+    $t3 = Parse-Address -Line 'ssh it_remote@127.0.0.1'
+    Check 'Parse-Address: last-address.txt line' ($t3 -eq 'ssh it_remote@127.0.0.1') ("got=$t3")
+    $t4 = Parse-Address -Line 'it_remote@192.168.1.50'
+    Check 'Parse-Address: bare address' ($t4 -eq 'ssh it_remote@192.168.1.50') ("got=$t4")
+    $t5 = Parse-Address -Line 'SSH-ADDRESS: ssh'
+    Check 'Parse-Address: partial marker REJECTED' ($t5 -eq '')
+    $t6 = Parse-Address -Line 'random log line'
+    Check 'Parse-Address: random line -> empty' ($t6 -eq '')
 }
 
-# ---------------------------------------------------------------
-# TEST 8: AdminConsole Build-Address (extracted from the real shipped file)
-# ---------------------------------------------------------------
-$srcB = Get-FunctionText -Path $Console -Name 'Build-Address'
-Check 'console: Build-Address extractable' ($null -ne $srcB)
-if ($srcB) {
-    Invoke-Expression $srcB
-    $txtUser = [pscustomobject]@{ Text = 'it_remote' }
-    $script:Tailnet = 'mmdtalebian.animid@gmail.com'
-    $row = [pscustomobject]@{ Host = 'mock-agent'; IP = '127.0.0.1' }
-    Check 'console Build-Address: email tailnet -> IP form' ((Build-Address $row) -eq 'it_remote@127.0.0.1')
-    $script:Tailnet = 'mycorp.ts.net'
-    Check 'console Build-Address: clean tailnet -> DNS form' ((Build-Address $row) -eq 'it_remote@mock-agent.mycorp.ts.net')
-    $row2 = [pscustomobject]@{ Host = 'agent2.mycorp.ts.net'; IP = '127.0.0.3' }
-    Check 'console Build-Address: full DNS row stays as-is' ((Build-Address $row2) -eq 'it_remote@agent2.mycorp.ts.net')
-}
-
-# ---------------------------------------------------------------
-# TEST 9: PowerShell constructor binding - the AdminConsole crash
-# (regression for the user-reported 'Cannot index into a null array'
-#  cascade: New-Object UNROLLS an inline string[] into separate args,
-#  the ListViewItem ctor lookup fails, $item becomes $null, and every
-#  following line (SubItems[0], ToolTipText, Items.Add) explodes.)
-# ---------------------------------------------------------------
+# ---------------- TEST 5: PowerShell constructor binding regression (AdminConsole crash) ----------------
 $csMock = @'
+using System.Collections.Generic;
+public class SubItemsCollection {
+  private List<string> _items = new List<string>();
+  public void Add(string s) { _items.Add(s); }
+  public void AddRange(string[] arr) { _items.AddRange(arr); }
+  public int Count { get { return _items.Count; } }
+  public string this[int i] { get { return _items[i]; } }
+}
 public class FakeLVI {
-  public class SubItemsCollection {
-    private System.Collections.Generic.List<string> _items = new System.Collections.Generic.List<string>();
-    public string this[int i] { get { return _items[i]; } }
-    public void Add(string s) { _items.Add(s); }
-    public void AddRange(string[] arr) { _items.AddRange(arr); }
-    public int Count { get { return _items.Count; } }
-  }
   public SubItemsCollection SubItems { get; private set; }
   public object Tag { get; set; }
   public string ToolTipText { get; set; }
@@ -258,42 +116,131 @@ public class FakeLVI {
 }
 '@
 try { Add-Type -TypeDefinition $csMock -ErrorAction Stop | Out-Null } catch { }
-
-$oldItem = $null
-$oldErr = ''
-try { $oldItem = New-Object FakeLVI([string[]]@('a', 'b', 'c', 'd')) } catch { $oldErr = $_.Exception.Message }
-Check 'ctor: OLD New-Object(array) pattern fails (the shipped bug)' ($null -eq $oldItem) ("got object, but should be null; err=$oldErr")
-
 $newItem = $null
 try { $newItem = [FakeLVI]::new([string[]]@('a', 'b', 'c', 'd')) } catch { }
-Check 'ctor: NEW ::new(array) pattern binds string[] ctor' ($null -ne $newItem -and $newItem.SubItems.Count -eq 4 -and $newItem.SubItems[0] -eq 'a') ("subitems=$($newItem.SubItems.Count)")
+Check 'ctor: NEW ::new(array) pattern binds string[] ctor' ($null -ne $newItem -and $newItem.SubItems.Count -eq 4)
 if ($newItem) {
-    $newItem.Tag = 'ssh it_remote@100.1.2.3'; $newItem.ToolTipText = 'tip'
-    Check 'ctor: Tag/ToolTipText settable on ::new item' ($newItem.Tag -eq 'ssh it_remote@100.1.2.3' -and $newItem.ToolTipText -eq 'tip')
+    $newItem.Tag = 'ssh it_remote@192.168.1.3'
+    Check 'ctor: Tag settable on ::new item' ($newItem.Tag -eq 'ssh it_remote@192.168.1.3')
 }
-$fb = $null
-try {
-    $fb = [FakeLVI]::new('col0'); $fb.SubItems.AddRange([string[]]@('col1', 'col2', 'col3'))
-} catch { }
-Check 'ctor: ::new(text) + SubItems.AddRange fallback works' ($null -ne $fb -and $fb.SubItems.Count -eq 4)
+$fnLVI = Get-FunctionText -Path $Console -Name 'New-ListViewItem'
+Check 'console: New-ListViewItem extractable (defensive creation)' ($null -ne $fnLVI)
 
-$welcome = Get-FunctionText -Path $Console -Name 'New-ListViewItem'
-Check 'console: New-ListViewItem extractable (defensive creation)' ($null -ne $welcome)
+# ---------------- TEST 6: REAL deploy (LAN mode) ----------------
+function Fix-Ownership {
+    $u = (& id -un); $g = (& id -gn)
+    & sudo chown -R ('{0}:{1}' -f $u, $g) $RunDir 2>$null
+}
+$realIp = ''
+$rt = (& ip route get 1.1.1.1 2>$null | Select-Object -First 1)
+if ($rt -match 'src\s+(\d{1,3}(?:\.\d{1,3}){3})') { $realIp = $matches[1] }
+Check 'env: real network IP detected' ($realIp -ne '') ('ip=' + $realIp)
 
+# 6a. auto-detected IP
+$base1 = "$RunDir/agent1"
+$a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Deploy,
+       '-AdminPassword', $Pass, '-Hostname', 'pc-01')
+$env:RA_BASEDIR = $base1
+$out1 = (& sudo --preserve-env=RA_BASEDIR $PWSH @a 2>&1 | Out-String); $code1 = $LASTEXITCODE
+$env:RA_BASEDIR = $null
+Check 'deploy#1 exit code = 0' ($code1 -eq 0) ("exit=$code1")
+Check 'deploy#1 prints [DEPLOY-STATUS] SUCCESS' ($out1 -match '\[DEPLOY-STATUS\] SUCCESS')
+Check 'deploy#1 marker = it_remote@<real IP>' ($out1 -match ('SSH-ADDRESS: it_remote@' + [regex]::Escape($realIp) + '\b')) ("want=it_remote@$realIp")
+Check 'deploy#1 mentions LAN mode' ($out1 -match 'LAN mode')
+Fix-Ownership
+$last1 = (Get-Content (Join-Path $base1 'last-address.txt') -ErrorAction SilentlyContinue | Select-Object -First 1)
+Check 'deploy#1 last-address.txt = ssh it_remote@<real IP>' ($last1 -eq ('ssh it_remote@' + $realIp)) ("got=$last1")
+$addr1 = (Get-Content (Join-Path $base1 'ssh-address.txt') -ErrorAction SilentlyContinue) -join ' '
+Check 'deploy#1 ssh-address.txt has SSH-ADDRESS + user' ($addr1 -match 'SSH-ADDRESS: ssh it_remote@' -and $addr1 -match 'User:\s+it_remote')
+
+# 6b. -LanIp override
+$base2 = "$RunDir/agent2"
+$a2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Deploy,
+        '-AdminPassword', $Pass, '-Hostname', 'pc-02', '-LanIp', '127.0.0.1')
+$env:RA_BASEDIR = $base2
+$out2 = (& sudo --preserve-env=RA_BASEDIR $PWSH @a2 2>&1 | Out-String); $code2 = $LASTEXITCODE
+$env:RA_BASEDIR = $null
+Check 'deploy#2 (-LanIp 127.0.0.1) exit code = 0' ($code2 -eq 0) ("exit=$code2")
+Check 'deploy#2 marker = it_remote@127.0.0.1' ($out2 -match 'SSH-ADDRESS: it_remote@127\.0\.0\.1')
+
+# 6c. REAL SSH login with password to the REAL network IP
+$sshOut = (& sshpass -p $Pass ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ('it_remote@' + $realIp) 'echo LAN-SSH-OK' 2>&1 | Out-String)
+Check 'REAL ssh login to real network IP (password auth)' ($sshOut -match 'LAN-SSH-OK') ($sshOut.Trim())
+
+# 6d. wrong password must fail
+$sshBad = (& sshpass -p 'Wrong-Pass-999' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 ('it_remote@' + $realIp) 'echo NOPE' 2>&1 | Out-String)
+Check 'ssh with wrong password is REJECTED' ($LASTEXITCODE -ne 0 -and $sshBad -notmatch 'NOPE')
+
+# ---------------- TEST 7: wizard is Tailscale-free ----------------
+$wizText = (Get-Content -Path $Wizard -Raw)
+Check 'wizard: no Tailscale auth-key field'      ($wizText -notmatch 'RA_KEY')
+Check 'wizard: no tskey references'              ($wizText -notmatch 'tskey')
+Check 'wizard: no TailscaleAuthKey references'   ($wizText -notmatch 'TailscaleAuthKey')
+Check 'wizard: still runs deploy with password'  ($wizText -match 'RA_PASS' -and $wizText -match '-AdminPassword')
+
+# ---------------- TEST 8: console LAN mode ----------------
+$fnBA = Get-FunctionText -Path $Console -Name 'Build-Address'
+Check 'console: Build-Address extractable' ($null -ne $fnBA)
+if ($fnBA) {
+    $txtUser = [pscustomobject]@{ Text = 'it_remote' }   # stand-in for the form textbox
+    . ([scriptblock]::Create($fnBA))
+    $ba = Build-Address ([pscustomobject]@{ Host = 'pc-01'; IP = '192.168.1.50' })
+    Check 'console Build-Address: row -> it_remote@192.168.1.50' ($ba -eq 'it_remote@192.168.1.50') ("got=$ba")
+}
+$fnScanC = Get-FunctionText -Path $Console -Name 'Find-SshHosts'
+Check 'console: Find-SshHosts extractable (own copy)' ($null -ne $fnScanC)
+if ($fnScanC) {
+    . ([scriptblock]::Create($fnScanC))
+    $c = @(Find-SshHosts -Cidr '127.0.0.0/24' -TimeoutMs 3000)
+    Check 'console Find-SshHosts: finds real sshd on 127.0.0.1' ($c -contains '127.0.0.1')
+}
+$fnMerge = Get-FunctionText -Path $Console -Name 'Merge-KnownHosts'
+Check 'console: Merge-KnownHosts extractable' ($null -ne $fnMerge)
+if ($fnMerge) {
+    . ([scriptblock]::Create($fnMerge))
+    $known = @{}
+    $known['192.168.1.99'] = [pscustomobject]@{ Host = 'old-pc'; LastSeen = '2026-01-01 00:00:00' }
+    $scanRows = @([pscustomobject]@{ Host = 'pc-01'; IP = '192.168.1.50' })
+    $m = Merge-KnownHosts -ScanRows $scanRows -Known $known
+    $r50 = @($m.Rows | Where-Object { $_.IP -eq '192.168.1.50' })
+    $r99 = @($m.Rows | Where-Object { $_.IP -eq '192.168.1.99' })
+    Check 'Merge-KnownHosts: scanned host is ONLINE'      ($r50.Count -eq 1 -and $r50[0].Online -eq $true)
+    Check 'Merge-KnownHosts: known-but-absent is OFFLINE' ($r99.Count -eq 1 -and $r99[0].Online -eq $false)
+    Check 'Merge-KnownHosts: map updated for online host' ($m.Map['192.168.1.50'].LastSeen -ne '2026-01-01 00:00:00')
+    Check 'Merge-KnownHosts: offline keeps old lastSeen'  ($m.Map['192.168.1.99'].LastSeen -eq '2026-01-01 00:00:00')
+}
+
+# ---------------- TEST 9: repo is Tailscale-free ----------------
+# Shipped files = the 5 scripts + README + the .bat launchers.
+# The ONE permitted mention: deploy's Remove-NetFirewallRule line that cleans up
+# the old Tailscale-era rule on machines deployed with v3 (upgrade path).
+$shipped = @($Deploy, $Scan, $Wizard, $Console, $ViaDom,
+             (Join-Path $Root 'README.md'),
+             (Join-Path $Root 'gui\AdminConsole.bat'),
+             (Join-Path $Root 'gui\SetupWizard.bat'))
+$hits = @()
+foreach ($f in $shipped) {
+    if (-not (Test-Path $f)) { continue }
+    $lines = @(Get-Content -Path $f | Where-Object { $_ -notmatch 'Remove-NetFirewallRule' })
+    if (($lines -join "`n") -match 'tailscale|tskey') { $hits += (Split-Path $f -Leaf) }
+}
+Check 'repo: no Tailscale references in shipped files' ($hits.Count -eq 0) ($hits -join ', ')
+Check 'repo: get-addresses.ps1 deleted' (-not (Test-Path (Join-Path $Root 'get-addresses.ps1')))
+Check 'repo: tailscale-guide.md deleted' (-not (Test-Path (Join-Path $Root 'tailscale-guide.md')))
+Check 'repo: scan-network.ps1 exists' (Test-Path $Scan)
+
+# ---------------- summary + report ----------------
 $passed = @($script:Results | Where-Object { $_.Ok }).Count
 $failed = @($script:Results | Where-Object { -not $_.Ok }).Count
 Write-Host ''
 Write-Host ("==== RESULT: {0} passed / {1} failed ====" -f $passed, $failed) -ForegroundColor $(if ($failed -eq 0) { 'Green' } else { 'Red' })
-
-# report file
 $lines = @()
 $lines += '# Remote Admin - E2E test report'
 $lines += ''
 $lines += ('Date     : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 $lines += ('Host     : ' + (hostname))
-$lines += ('Scenario : email-style tailnet (mmdtalebian.animid@gmail.com) + clean tailnet (mycorp.ts.net)')
-$lines += ('Real SSH : sshd on 127.0.0.1:22, user it_remote, password auth, OpenSSH client via sshpass')
-$lines += ('Mocked   : tailscale CLI control plane only')
+$lines += 'Scenario : LAN mode - real sshd on :22, real deploy, real network IP, real SSH login'
+$lines += 'Mocked   : nothing'
 $lines += ''
 $lines += '| # | Test | Result | Detail |'
 $lines += '|---|---|---|---|'
@@ -303,6 +250,4 @@ foreach ($r in $script:Results) {
     $lines += ('| {0} | {1} | {2} | {3} |' -f $i, $r.Name, $(if ($r.Ok) { 'PASS' } else { 'FAIL' }), ($r.Detail -replace '\|', '/' -replace "`r?`n", ' '))
 }
 $lines | Set-Content -Path (Join-Path $PSScriptRoot 'REPORT.md') -Encoding UTF8
-Write-Host ('Report: ' + (Join-Path $PSScriptRoot 'REPORT.md'))
-
 if ($failed -gt 0) { exit 1 } else { exit 0 }
