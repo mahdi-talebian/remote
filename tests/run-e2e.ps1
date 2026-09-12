@@ -18,7 +18,6 @@ $Scan    = Join-Path $Root 'scan-network.ps1'
 $Wizard  = Join-Path $Root 'gui\SetupWizard.ps1'
 $Console = Join-Path $Root 'gui\AdminConsole.ps1'
 $ViaDom  = Join-Path $Root 'deploy-via-domain.ps1'
-$GetAddr = Join-Path $Root 'get-addresses.ps1'   # exists until Task 5 (Tailscale-era file)
 $Pass    = 'Test-Pass-147!xyZ'
 $RunDir  = '/tmp/e2e-remote-admin'
 
@@ -44,12 +43,12 @@ Remove-RunDir
 
 # ---------------- TEST 0: all scripts parse ----------------
 $allOk = $true
-foreach ($f in @($Deploy, $Scan, $Wizard, $Console, $ViaDom, $GetAddr)) {
+foreach ($f in @($Deploy, $Scan, $Wizard, $Console, $ViaDom)) {
     $t = $null; $e = $null
     [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$t, [ref]$e) | Out-Null
     if ($e.Count) { $allOk = $false; Check ('parse: ' + (Split-Path $f -Leaf)) $false ($e[0].Message) }
 }
-if ($allOk) { Check 'parse: all 6 PowerShell scripts' $true }
+if ($allOk) { Check 'parse: all 5 PowerShell scripts' $true }
 
 # ---------------- TEST 1: scanner functions extractable from scan-network.ps1 ----------------
 $fnScan   = Get-FunctionText -Path $Scan -Name 'Find-SshHosts'
@@ -210,6 +209,25 @@ if ($fnMerge) {
     Check 'Merge-KnownHosts: map updated for online host' ($m.Map['192.168.1.50'].LastSeen -ne '2026-01-01 00:00:00')
     Check 'Merge-KnownHosts: offline keeps old lastSeen'  ($m.Map['192.168.1.99'].LastSeen -eq '2026-01-01 00:00:00')
 }
+
+# ---------------- TEST 9: repo is Tailscale-free ----------------
+# Shipped files = the 5 scripts + README + the .bat launchers.
+# The ONE permitted mention: deploy's Remove-NetFirewallRule line that cleans up
+# the old Tailscale-era rule on machines deployed with v3 (upgrade path).
+$shipped = @($Deploy, $Scan, $Wizard, $Console, $ViaDom,
+             (Join-Path $Root 'README.md'),
+             (Join-Path $Root 'gui\AdminConsole.bat'),
+             (Join-Path $Root 'gui\SetupWizard.bat'))
+$hits = @()
+foreach ($f in $shipped) {
+    if (-not (Test-Path $f)) { continue }
+    $lines = @(Get-Content -Path $f | Where-Object { $_ -notmatch 'Remove-NetFirewallRule' })
+    if (($lines -join "`n") -match 'tailscale|tskey') { $hits += (Split-Path $f -Leaf) }
+}
+Check 'repo: no Tailscale references in shipped files' ($hits.Count -eq 0) ($hits -join ', ')
+Check 'repo: get-addresses.ps1 deleted' (-not (Test-Path (Join-Path $Root 'get-addresses.ps1')))
+Check 'repo: tailscale-guide.md deleted' (-not (Test-Path (Join-Path $Root 'tailscale-guide.md')))
+Check 'repo: scan-network.ps1 exists' (Test-Path $Scan)
 
 # ---------------- summary + report ----------------
 $passed = @($script:Results | Where-Object { $_.Ok }).Count

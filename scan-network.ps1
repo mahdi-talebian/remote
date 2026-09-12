@@ -2,7 +2,7 @@
 .SYNOPSIS
     Scans the local network (default: the /24 subnet of this machine's LAN IP)
     for hosts with an open SSH port (22) and prints their SSH addresses.
-    Saves the list to .\ssh-addresses.txt  (LAN mode - no Tailscale)
+    Saves the list to .\ssh-addresses.txt  (LAN mode)
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scan-network.ps1
