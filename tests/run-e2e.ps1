@@ -179,6 +179,38 @@ Check 'wizard: no tskey references'              ($wizText -notmatch 'tskey')
 Check 'wizard: no TailscaleAuthKey references'   ($wizText -notmatch 'TailscaleAuthKey')
 Check 'wizard: still runs deploy with password'  ($wizText -match 'RA_PASS' -and $wizText -match '-AdminPassword')
 
+# ---------------- TEST 8: console LAN mode ----------------
+$fnBA = Get-FunctionText -Path $Console -Name 'Build-Address'
+Check 'console: Build-Address extractable' ($null -ne $fnBA)
+if ($fnBA) {
+    $txtUser = [pscustomobject]@{ Text = 'it_remote' }   # stand-in for the form textbox
+    . ([scriptblock]::Create($fnBA))
+    $ba = Build-Address ([pscustomobject]@{ Host = 'pc-01'; IP = '192.168.1.50' })
+    Check 'console Build-Address: row -> it_remote@192.168.1.50' ($ba -eq 'it_remote@192.168.1.50') ("got=$ba")
+}
+$fnScanC = Get-FunctionText -Path $Console -Name 'Find-SshHosts'
+Check 'console: Find-SshHosts extractable (own copy)' ($null -ne $fnScanC)
+if ($fnScanC) {
+    . ([scriptblock]::Create($fnScanC))
+    $c = @(Find-SshHosts -Cidr '127.0.0.0/24' -TimeoutMs 3000)
+    Check 'console Find-SshHosts: finds real sshd on 127.0.0.1' ($c -contains '127.0.0.1')
+}
+$fnMerge = Get-FunctionText -Path $Console -Name 'Merge-KnownHosts'
+Check 'console: Merge-KnownHosts extractable' ($null -ne $fnMerge)
+if ($fnMerge) {
+    . ([scriptblock]::Create($fnMerge))
+    $known = @{}
+    $known['192.168.1.99'] = [pscustomobject]@{ Host = 'old-pc'; LastSeen = '2026-01-01 00:00:00' }
+    $scanRows = @([pscustomobject]@{ Host = 'pc-01'; IP = '192.168.1.50' })
+    $m = Merge-KnownHosts -ScanRows $scanRows -Known $known
+    $r50 = @($m.Rows | Where-Object { $_.IP -eq '192.168.1.50' })
+    $r99 = @($m.Rows | Where-Object { $_.IP -eq '192.168.1.99' })
+    Check 'Merge-KnownHosts: scanned host is ONLINE'      ($r50.Count -eq 1 -and $r50[0].Online -eq $true)
+    Check 'Merge-KnownHosts: known-but-absent is OFFLINE' ($r99.Count -eq 1 -and $r99[0].Online -eq $false)
+    Check 'Merge-KnownHosts: map updated for online host' ($m.Map['192.168.1.50'].LastSeen -ne '2026-01-01 00:00:00')
+    Check 'Merge-KnownHosts: offline keeps old lastSeen'  ($m.Map['192.168.1.99'].LastSeen -eq '2026-01-01 00:00:00')
+}
+
 # ---------------- summary + report ----------------
 $passed = @($script:Results | Where-Object { $_.Ok }).Count
 $failed = @($script:Results | Where-Object { -not $_.Ok }).Count

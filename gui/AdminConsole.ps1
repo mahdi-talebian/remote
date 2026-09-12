@@ -1,18 +1,19 @@
 ﻿<#
 .SYNOPSIS
-    GUI control panel (admin side).
+    GUI control panel (admin side) - LAN mode.
 
-    Shows every employee machine in your Tailscale tailnet with online/offline
-    status and SSH addresses. Double-click a row (or press "Connect") to open
-    an SSH terminal to that machine.
+    Scans the local network (the /24 subnet of this machine) for SSH hosts and
+    shows every employee machine with online/offline status and its SSH
+    address. Double-click a row (or press "Connect") to open an SSH terminal
+    to that machine.
 
     No installation needed - built with Windows Forms / PowerShell.
     Run:  powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\AdminConsole.ps1
          (or just double-click AdminConsole.bat)
 
 .NOTES
-    Requires: Tailscale installed & logged in on THIS machine (admin side).
-    PowerShell 5.1+ (ships with Windows 10/11).
+    Requires: this machine and the employee machines on the SAME local
+    network (same router). PowerShell 5.1+ (ships with Windows 10/11).
 #>
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -55,14 +56,132 @@ function New-FlatButton {
 # ---------------------------------------------------------------
 # State
 # ---------------------------------------------------------------
-$tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
-if (-not (Test-Path $tsExe)) {
-    $tsExe = Get-Command tailscale -ErrorAction SilentlyContinue | ForEach-Object { $_.Source }
-}
 $script:Rows       = @()
-$script:Tailnet    = ''
+$script:Subnet     = ''
 $script:RefreshJob = $null
 $script:ToastTimer = $null
+
+# ---------------------------------------------------------------
+# LAN scanner (standalone copy; scan-network.ps1 has its own)
+# ---------------------------------------------------------------
+function Get-LocalIp {
+    # Best-effort LAN IPv4 of THIS machine (default-route interface first).
+    $isWin = ($env:OS -eq 'Windows_NT')
+    if ($isWin) {
+        try {
+            $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                Sort-Object RouteMetric | Select-Object -First 1
+            if ($route) {
+                $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | Select-Object -First 1
+                if ($ip) { return [string]$ip.IPAddress }
+            }
+        } catch { }
+        $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -ne 'Loopback' -and $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+            Select-Object -First 1
+        if ($ip) { return [string]$ip.IPAddress }
+        return ''
+    }
+    $out = (& ip route get 1.1.1.1 2>$null | Select-Object -First 1)
+    if ($out -match 'src\s+(\d{1,3}(?:\.\d{1,3}){3})') { return $matches[1] }
+    $out = (& hostname -I 2>$null | Select-Object -First 1)
+    if ($out) { return ([string]$out).Trim().Split(' ')[0] }
+    return ''
+}
+
+function Get-LocalSubnet {
+    # The /24 that contains the given (or this machine's) LAN IP:  '192.168.1.0/24'
+    param([string]$Ip = '')
+    if (-not $Ip) { $Ip = Get-LocalIp }
+    if ($Ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { return '' }
+    return ('{0}.0/24' -f (($Ip.Split('.')[0..2]) -join '.'))
+}
+
+function Get-SubnetHosts {
+    # '192.168.1.0/24' -> 192.168.1.1 .. 192.168.1.254   (string[])
+    param([string]$Cidr)
+    if ($Cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') { return @() }
+    $base = ($Cidr.Split('/')[0]).Split('.')[0..2] -join '.'
+    return @(1..254 | ForEach-Object { '{0}.{1}' -f $base, $_ })
+}
+
+function Find-SshHosts {
+    # Parallel async TCP-connect sweep for an open TCP port. Returns the IPs that answered.
+    param([string]$Cidr, [int]$Port = 22, [int]$TimeoutMs = 800, [string[]]$ExcludeIps = @())
+    if (-not $Cidr) { return @() }
+    $targets = @(Get-SubnetHosts -Cidr $Cidr | Where-Object { $ExcludeIps -notcontains $_ })
+    if ($targets.Count -eq 0) { return @() }
+    $pending = @()
+    foreach ($ip in $targets) {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($ip, $Port, $null, $null)
+        $pending += [pscustomobject]@{ Client = $client; Async = $iar; Ip = $ip }
+    }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $found = @()
+    foreach ($p in $pending) {
+        $remain = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        $signaled = $p.Async.AsyncWaitHandle.WaitOne($remain)
+        if ($signaled -and $p.Client.Connected) { $found += $p.Ip }
+        try { $p.Client.Close() } catch { }
+    }
+    return @($found)
+}
+
+function Get-HostNameForIp {
+    # Best-effort reverse DNS; '' when it cannot be resolved.
+    param([string]$Ip)
+    try {
+        $entry = [System.Net.Dns]::GetHostEntry($Ip)
+        if ($entry -and $entry.HostName) { return ($entry.HostName -split '\.')[0] }
+    } catch { }
+    return ''
+}
+
+# ---------------------------------------------------------------
+# Known-hosts memory (machines seen before -> shown as offline when absent)
+# ---------------------------------------------------------------
+$script:KnownDir  = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'RemoteAdminConsole' }
+                    else { Join-Path $HOME '.remote-admin-console' }
+$script:KnownFile = Join-Path $script:KnownDir 'known-hosts.json'
+
+function Load-KnownHosts {
+    if (-not (Test-Path $script:KnownFile)) { return @{} }
+    try {
+        $list = @(Get-Content -Path $script:KnownFile -Encoding UTF8 -Raw | ConvertFrom-Json)
+        $map = @{}
+        foreach ($e in $list) { $map[[string]$e.ip] = [pscustomobject]@{ Host = [string]$e.host; LastSeen = [string]$e.lastSeen } }
+        return $map
+    } catch { return @{} }
+}
+function Save-KnownHosts {
+    param([hashtable]$Map)
+    try {
+        New-Item -ItemType Directory -Force -Path $script:KnownDir | Out-Null
+        $list = @($Map.Keys | ForEach-Object { [pscustomobject]@{ ip = $_; host = $Map[$_].Host; lastSeen = $Map[$_].LastSeen } })
+        if ($list.Count -eq 0) { return }
+        ($list | ConvertTo-Json) | Set-Content -Path $script:KnownFile -Encoding UTF8
+    } catch { }
+}
+function Merge-KnownHosts {
+    # fresh scan rows + previously known hosts -> all rows (online/offline) + updated map
+    param([object[]]$ScanRows, [hashtable]$Known)
+    $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $map = @{}
+    foreach ($k in $Known.Keys) {
+        $map[$k] = [pscustomobject]@{ Host = $Known[$k].Host; LastSeen = $Known[$k].LastSeen; Online = $false }
+    }
+    foreach ($r in $ScanRows) {
+        $map[[string]$r.IP] = [pscustomobject]@{ Host = [string]$r.Host; LastSeen = $now; Online = $true }
+    }
+    $rows = @()
+    foreach ($ip in $map.Keys) {
+        $rows += [pscustomobject]@{ Host = $map[$ip].Host; IP = $ip; Online = $map[$ip].Online }
+    }
+    return @{ Rows = @($rows); Map = $map }
+}
+$script:KnownHosts = Load-KnownHosts
 
 # ---------------------------------------------------------------
 # Form shell
@@ -161,7 +280,7 @@ $listView.ShowItemToolTips = $true
 [void]$listView.Columns.Add('وضعیت', 90)
 [void]$listView.Columns.Add('نام دستگاه', 190)
 [void]$listView.Columns.Add('آدرس SSH', 380)
-[void]$listView.Columns.Add('IP شبکه خصوصی', 160)
+[void]$listView.Columns.Add('IP شبکه محلی', 160)
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $miConnect = New-Object System.Windows.Forms.ToolStripMenuItem('اتصال SSH')
@@ -190,20 +309,13 @@ function Update-Status {
     $total = $script:Rows.Count
     $online = @($script:Rows | Where-Object { $_.Online }).Count
     $offline = $total - $online
-    $tn = if ($script:Tailnet) { "  |  tailnet: $($script:Tailnet)" } else { '' }
-    $lblStatus.Text = "$online آنلاین  •  $offline آفلاین  (کل: $total)$tn"
+    $sn = if ($script:Subnet) { "  |  زیرشبکه: $($script:Subnet)" } else { '' }
+    $lblStatus.Text = "$online آنلاین  •  $offline آفلاین  (کل: $total)$sn"
 }
 
 function Build-Address {
     param($Row)
-    $h  = [string]$Row.Host
-    $tn = [string]$script:Tailnet
-    $safeTn = ($tn -match '^[A-Za-z0-9.\-]+$')   # SSH cannot parse '@'/' ' inside host names
-    if ($h -match '@| ')      { return "$($txtUser.Text)@$($Row.IP)" }   # unsafe hostname -> IP
-    if ($safeTn -eq $false)   { return "$($txtUser.Text)@$($Row.IP)" }   # unsafe tailnet (email) -> IP
-    if ($h -match '\.')       { return "$($txtUser.Text)@$h" }           # already a full DNS name
-    if ($tn -ne '')           { return "$($txtUser.Text)@$h.$tn" }
-    return "$($txtUser.Text)@$($Row.IP)"
+    return ('{0}@{1}' -f $txtUser.Text, [string]$Row.IP)
 }
 
 function New-ListViewItem {
@@ -272,29 +384,26 @@ $refreshTimer.Interval = 400
 function Invoke-Refresh {
     if ($script:RefreshJob -and $script:RefreshJob.State -eq 'Running') { return }
     $btnRefresh.Enabled = $false
-    $btnRefresh.Text = 'در حال بروزرسانی...'
+    $btnRefresh.Text = 'در حال اسکن شبکه...'
+    $own = Get-LocalIp
+    # Jobs do not inherit session functions - pass the function bodies as text.
     $script:RefreshJob = Start-Job -ScriptBlock {
-        param($tailscaleExe)
-        $rows = @(); $tn = ''; $err = ''
+        param($fGetLocalIp, $fGetSubnet, $fFindHosts, $fRevDns, $ownIp)
+        Set-Item -Path function:Get-LocalIp -Value $fGetLocalIp
+        Set-Item -Path function:Get-LocalSubnet -Value $fGetSubnet
+        Set-Item -Path function:Find-SshHosts -Value $fFindHosts
+        Set-Item -Path function:Get-HostNameForIp -Value $fRevDns
+        $rows = @(); $cidr = ''; $err = ''
         try {
-            $lines = & $tailscaleExe status 2>$null | Where-Object { $_ -match '^(\d{1,3}\.){3}\d{1,3}\s+\S+' }
-            foreach ($line in $lines) {
-                $p = $line -split '\s+'
-                if ($p.Count -lt 2) { continue }
-                $rows += [pscustomobject]@{
-                    Host   = $p[1]
-                    IP     = $p[0]
-                    Online = ($line -notmatch 'offline')
-                }
+            $cidr = Get-LocalSubnet
+            $ips = @(Find-SshHosts -Cidr $cidr -ExcludeIps @($ownIp))
+            foreach ($ip in $ips) {
+                $rows += [pscustomobject]@{ Host = (Get-HostNameForIp -Ip $ip); IP = $ip }
             }
         } catch { $err = [string]$_.Exception.Message }
-        try {
-            $json = (& $tailscaleExe status --json 2>$null | Out-String)
-            $j = $json | ConvertFrom-Json
-            if ($j -and $j.CurrentTailnet) { $tn = [string]$j.CurrentTailnet.Name }
-        } catch { }
-        [pscustomobject]@{ Rows = $rows; Tailnet = $tn; Error = $err }
-    } -ArgumentList $tsExe
+        [pscustomobject]@{ Rows = $rows; Subnet = $cidr; Error = $err }
+    } -ArgumentList ${function:Get-LocalIp}.ToString(), ${function:Get-LocalSubnet}.ToString(), `
+                     ${function:Find-SshHosts}.ToString(), ${function:Get-HostNameForIp}.ToString(), $own
     $refreshTimer.Start()
 }
 
@@ -310,11 +419,14 @@ $refreshTimer.Add_Tick({
     if ($res -is [pscustomobject]) {
         if ($res.Error) {
             [System.Windows.Forms.MessageBox]::Show(
-                "خطا در خواندن اطلاعات Tailscale:`r`n$($res.Error)`r`n`r`nآیا Tailscale روی این سیستم نصب و لاگین شده است؟",
+                "خطا در اسکن شبکه:`r`n$($res.Error)`r`n`r`nآیا این سیستم به شبکه محلی وصل است؟",
                 'خطا', 'OK', 'Warning') | Out-Null
         }
-        $script:Rows = $res.Rows
-        $script:Tailnet = if ($res.Tailnet) { $res.Tailnet } else { $script:Tailnet }
+        $merged = Merge-KnownHosts -ScanRows @($res.Rows) -Known $script:KnownHosts
+        $script:Rows       = $merged.Rows
+        $script:KnownHosts = $merged.Map
+        $script:Subnet     = $res.Subnet
+        Save-KnownHosts -Map $merged.Map
     }
     Rebuild-List
 })
@@ -385,16 +497,17 @@ function Invoke-Save {
 function Invoke-Help {
     [System.Windows.Forms.MessageBox]::Show(
         @'
-کنسول مدیریت SSH کارمندان
+کنسول مدیریت SSH کارمندان (شبکه محلی)
 ------------------------------
 1) روی هر کامپیوتر کارمند، پوشه gui را کپی کنید و SetupWizard.bat را اجرا کنید
-   (کلید Tailscale + رمز عبور را همان جا وارد می کنند).
-2) اینجا دکمه «بروزرسانی» را بزنید تا سیستم ها با وضعیت آنلاین/آفلاین بیایند.
+   (فقط نام دستگاه و رمز عبور را وارد می کنند - هر دو سیستم باید زیر یک مودم باشند).
+2) اینجا دکمه «بروزرسانی» را بزنید تا سیستم ها با اسکن شبکه پیدا شوند.
 3) دوبار کلیک روی هر ردیف (یا دکمه «اتصال SSH») ترمینال را باز می کند.
    رمز ورود = همان رمزی که در ویزارد وارد شد.
 
-آدرس ها فقط از داخل شبکه Tailscale (tailnet خودتان) قابل استفاده اند
-و روی اینترنت در دسترس نیستند.
+سیستم هایی که قبلا دیده شده اند ولی الان روشن نیستند، «آفلاین» نمایش داده می شوند.
+توجه: هر چیزی در شبکه که پورت SSH باز داشته باشد (مثل روتر) در لیست می آید؛
+ستون «نام دستگاه» کمک می کند سیستم های خودتان را تشخیص دهید.
 '@, 'راهنما', 'OK', 'Information') | Out-Null
 }
 
